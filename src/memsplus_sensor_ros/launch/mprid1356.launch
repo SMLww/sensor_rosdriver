@@ -1,0 +1,21 @@
+<launch>
+    <!-- 定义可覆盖的参数 -->
+    <arg name="mapping_mode" default="false" doc="Enable mapping mode"/>
+    <arg name="initial_id" default="1" doc="Enable initial id"/>
+    <arg name="distance_thr" default="1.0" doc="Enable to help id increment"/>
+    <arg name="signal_thr" default="7" doc="Enable min RSSi writting threshold"/>
+    
+  
+    <node name="mprid1356_node" pkg="memsplus_sensor_ros" type="mprid1356_node" 
+        launch-prefix="bash -c 'chmod 666 /dev/ttyUSB0; $0 $@'" output="screen">
+        <param name="port" value="/dev/ttyUSB0"/>
+        <param name="baudrate" value="115200"/>                         <!-- defualt baudrate -->
+        <param name="device_address" value="6"/>                        <!-- defualt device address -->
+        <param name="read_frequency" value="100.0"/>                    <!-- the frequency can custom -->
+        <param name="available_bytes" value="8" />                      <!-- defualt 8 byte-->
+        <param name="is_mapping_mode" value="$(arg mapping_mode)" />    <!-- if need location set true-->
+        <param name="intial_tag_id" value="$(arg initial_id)" />        <!-- customization intial tag id-->
+        <param name="tag_distance_thr" value="$(arg distance_thr)" />   <!-- customization both tag writer distance constraint -->
+        <param name="min_signal_thr" value="$(arg signal_thr)" />       <!-- customization min tag signal threshold-->
+    </node>
+</launch>
