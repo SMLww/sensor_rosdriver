@@ -1,0 +1,46 @@
+/**
+ * @brief 计算两个二维坐标点之间的欧式距离
+ * 
+ * 基于欧式距离公式 sqrt((x2-x1)² + (y2-y1)²) 实现，
+ * 支持double类型坐标，返回高精度距离值。
+ * 
+ * @param x1 第一个点的x坐标
+ * @param y1 第一个点的y坐标
+ * @param x2 第二个点的x坐标
+ * @param y2 第二个点的y坐标
+ * @return double 两点之间的欧式距离（单位：与输入坐标一致）
+ * @note 若输入坐标为负数，仍能正确计算（距离非负）
+ * @warning 输入坐标值过大可能导致精度损失
+ * @example 
+ *   double dist = calculateDistance(0, 0, 3, 4); // 返回5.0
+ */
+
+
+<launch>
+    <!-- 全局控制参数 -->
+    <arg name="launch_all" default="true" doc="同时启动两个节点"/>
+    <arg name="launch_rfid" default="$(arg launch_all)" doc="是否启动RFID节点"/>
+    <arg name="launch_mags" default="$(arg launch_all)" doc="是否启动磁传感器节点"/>
+    
+    <!-- 节点共享参数 -->
+    <arg name="port_rfid" default="/dev/ttyUSB0" doc="RFID设备串口"/>
+    <arg name="port_mags" default="/dev/ttyUSB1" doc="磁传感器串口"/>
+    
+    <!-- 包含RFID节点的启动配置 -->
+    <group if="$(arg launch_rfid)">
+        <include file="$(find memsplus_sensor_ros)/launch/mprid1356.launch">
+            <arg name="port" value="$(arg port_rfid)"/>
+            <arg name="mapping_mode" value="$(arg mapping_mode)"/>
+            <arg name="initial_id" value="$(arg initial_id)"/>
+            <arg name="distance_thr" value="$(arg distance_thr)"/>
+            <arg name="signal_thr" value="$(arg signal_thr)"/>
+        </include>
+    </group>
+    
+    <!-- 包含磁传感器节点的启动配置 -->
+    <group if="$(arg launch_mags)">
+        <include file="$(find memsplus_sensor_ros)/launch/mpmgs201.launch">
+            <arg name="port" value="$(arg port_mags)"/>
+        </include>
+    </group>
+</launch>
