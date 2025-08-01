@@ -44,3 +44,102 @@
         </include>
     </group>
 </launch>
+
+
+
+
+#include <ros/ros.h>
+#include <serial/serial.h>
+#include <std_msgs/String.h>
+#include "mpmgs20x/MagneticNavigation.h"
+
+serial::Serial ser;
+
+// 校验和计算（不含帧头0x4D）
+uint8_t calculateChecksum(const uint8_t* data, size_t len) {
+    uint8_t checksum = 0;
+    for (size_t i = 0; i < len; ++i) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+
+int main(int argc, char**argv) {
+    ros::init(argc, argv, "mpmgs20x_rs232_node");
+    ros::NodeHandle nh;
+    ros::Publisher nav_pub = nh.advertise<mpmgs20x::MagneticNavigation>("magnetic_navigation", 100);
+
+    // 串口参数配置
+    std::string port;
+    int baudrate;
+    nh.param<std::string>("port", port, "/dev/ttyUSB0");
+    nh.param<int>("baudrate", baudrate, 115200);
+
+    try {
+        ser.setPort(port);
+        ser.setBaudrate(baudrate);
+        serial::Timeout to = serial::Timeout::simpleTimeout(100);
+        ser.setTimeout(to);
+        ser.open();
+    } catch (serial::IOException& e) {
+        ROS_ERROR_STREAM("无法打开串口: " << e.what());
+        return -1;
+    }
+
+    if (ser.isOpen()) {
+        ROS_INFO_STREAM("串口已打开: " << port << " @ " << baudrate);
+    } else {
+        return -1;
+    }
+
+    ros::Rate loop_rate(200); // 高于最大输出速率
+    uint8_t buffer[1024];
+    size_t buffer_len = 0;
+
+    while (ros::ok()) {
+        if (ser.available()) {
+            size_t n = ser.read(&buffer[buffer_len], sizeof(buffer) - buffer_len);
+            buffer_len += n;
+
+            // 解析帧数据（寻找0x4D开头的完整帧）
+            for (size_t i = 0; i < buffer_len; ++i) {
+                if (buffer[i] == 0x4D && (buffer_len - i) >= 7) { // 最小帧长：1（头）+1+1+1+1+2+1=8字节
+                    uint8_t* frame = &buffer[i];
+                    uint8_t field_num = frame[1];
+                    uint8_t checksum = frame[7]; // 第8字节为校验和
+
+                    // 校验和验证
+                    if (calculateChecksum(&frame[1], 6) == checksum) {
+                        mpmgs20x::MagneticNavigation msg;
+                        msg.field_num = field_num;
+                        msg.field1_offset = static_cast<int8_t>(frame[2]);
+                        msg.field2_offset = static_cast<int8_t>(frame[3]);
+                        msg.field3_offset = static_cast<int8_t>(frame[4]);
+                        msg.active_bits = (frame[5] << 8) | frame[6]; // 拼接高低位
+
+                        nav_pub.publish(msg);
+                        ROS_DEBUG("发布导航数据: 段数=%d, 偏移1=%dmm, 点位=0x%04X",
+                                 field_num, msg.field1_offset, msg.active_bits);
+                    }
+
+                    // 移除已解析的帧
+                    buffer_len -= (i + 8);
+                    memmove(buffer, &buffer[i + 8], buffer_len);
+                    i = 0; // 重新检查缓冲区
+                }
+            }
+
+            // 处理不完整帧（保留末尾不完整部分）
+            if (buffer_len >= sizeof(buffer)) {
+                ROS_WARN("缓冲区溢出，清空数据");
+                buffer_len = 0;
+            }
+        }
+
+        ros::spinOnce();
+        loop_rate.sleep();
+    }
+
+    ser.close();
+    return 0;
+}

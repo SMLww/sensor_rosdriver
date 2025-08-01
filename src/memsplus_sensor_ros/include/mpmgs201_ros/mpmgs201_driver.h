@@ -19,6 +19,7 @@ private:
 
     bool sendCommand(const std::vector<uint8_t> command, const std::vector<uint8_t>::size_type size);
     void parseResponse(const std::vector<uint8_t>& response);
+    uint8_t calculateChecksum(const uint8_t* data, size_t len);
 
     serial::Serial serial_;
     ros::Publisher mag_offset_pub;
@@ -28,9 +29,11 @@ private:
     int dev_addr_;
     double freq_;
 
+    uint8_t buffer[1024];
+    size_t buffer_len = 0;
 
     // The data read command -- 数据读取指令
-    const std::vector<uint8_t> read_cmd = {0x04, 0x03, 0x00, 0x04, 0x00, 0x03, 0x44, 0x5F};
+    // const std::vector<uint8_t> read_cmd = {0x04, 0x03, 0x00, 0x04, 0x00, 0x03, 0x44, 0x5F};
 };
 
 #endif // MPMGS201_DRIVER_H
