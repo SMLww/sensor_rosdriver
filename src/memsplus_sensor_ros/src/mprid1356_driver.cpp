@@ -9,7 +9,7 @@ Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh){
     nh.param("is_mapping_mode", is_mapping_mode_, false);   // default false -> location -- 默认定位模式
     nh.param("tag_distance_thr", tag_distance_thr_, 1.0);   // tag id help distance threshold
     nh.param("intial_tag_id", intial_tag_id_, 1);
-    nh.param("min_signal_thr", min_signal_thr_, 7);
+    nh.param("min_signal_thr", min_signal_thr_, 7);         // recommand setting 1 as min_signal threshold
 
     // intial start tag id 
     if (intial_tag_id_ < 0 || intial_tag_id_ > UINT16_MAX) {
@@ -36,7 +36,7 @@ Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh){
 
     pose_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/pose", 10, &Mprid1356_Driver::poseCallback, this);
     offset_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/mag_offset", 10, &Mprid1356_Driver::offsetCallback, this);
-    tag_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 10);
+    tag_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 10); // 
 }
 
 Mprid1356_Driver::~Mprid1356_Driver(){
@@ -131,8 +131,8 @@ void Mprid1356_Driver::processMappingMode(){
         std::string response_str = serial_.read(8);
         std::vector<uint8_t> response(response_str.begin(), response_str.end());
         if (response.size() == 8 && response[5] == 0x04){
-            ROS_INFO("Tag id = %d writing success, x = %lf y = %lf", 
-                static_cast<int>(next_tag_id_), pose_x_, pose_y_);
+            ROS_INFO("Tag id = %d writing success, x = %lf y = %lf, y direction offset = %lf", 
+                static_cast<int>(next_tag_id_), pose_x_, pose_y_, offset_y_);
             if (std::hypot(id_help_pose[0] - pose_x_, id_help_pose[1] - pose_y_) >= tag_distance_thr_){
                 if (id_help_pose[0] != 0.0 && id_help_pose[0] != 0.0) next_tag_id_++;
                 id_help_pose[0] = pose_x_;

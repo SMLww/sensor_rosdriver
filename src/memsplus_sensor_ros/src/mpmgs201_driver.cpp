@@ -51,20 +51,21 @@ void Mpmgs201_Driver::mainLoop() {
                 uint8_t field_num = frame[1];
                 uint8_t checksum = frame[7]; //the eighth byte is check sum
 
-                if (calculateChecksum(&frame[1], 6) == checksum) {
+                if (calculateChecksum(&frame[1], 6) == checksum && frame[1] == 0x01) {
                     geometry_msgs::PoseStamped mag_offset;
 
                     mag_offset.header.stamp = ros::Time::now();
 
-                    mag_offset.pose.position.y = static_cast<double>(frame[2] / 1000.0);
+                    mag_offset.pose.position.y = static_cast<double>(static_cast<int8_t>(frame[2]) / 1000.0);
 
                     mag_offset_pub.publish(mag_offset);
                     ROS_INFO("The Y axis offset = %lf", mag_offset.pose.position.y);
                 }
-                // remove the resolved frame
-                buffer_len -= (i + 8);
-                memmove(buffer, &buffer[i + 8], buffer_len);
+                // reset buffer_len, buffer and i;
+                buffer_len = 0;
+                memset(buffer, 0, sizeof(buffer));
                 i = 0; // recheck the buffer
+                break; // end a data reading
             }
         }
         ros::spinOnce();
@@ -76,11 +77,11 @@ void Mpmgs201_Driver::mainLoop() {
  * @brief calculate and check sun - RS-232
  */
 uint8_t Mpmgs201_Driver::calculateChecksum(const uint8_t* data, size_t len) {
-    uint8_t checksum = 0;
+    uint16_t checksum = 0;
     for (size_t i = 0; i < len; ++i) {
-        checksum ^= data[i];
+        checksum += data[i];
     }
-    return checksum;
+    return static_cast<uint8_t>(checksum);
 }
 
 /**
