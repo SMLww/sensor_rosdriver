@@ -1,9 +1,10 @@
 <launch>
     <node name="mpmgs201_node" pkg="memsplus_sensor_ros" type="mpmgs201_node" 
-        launch-prefix="bash -c 'chmod 666 /dev/ttyUSB0; $0 $@'" output="screen">
-        <param name="port" value="/dev/ttyUSB0"/>
-        <param name="baudrate" value="115200"/>                         <!-- defualt baudrate -->
-        <param name="device_address" value="6"/>                        <!-- defualt device address -->
-        <param name="read_frequency" value="100.0"/>                    <!-- the frequency can custom -->
+        launch-prefix="bash -c 'chmod 666 /dev/ttyS1; $0 $@'" output="screen">
+        <param name="port" value="/dev/ttyS1"/>
+        <param name="baudrate" value="115200"/>                             <!-- defualt baudrate -->
+        <param name="device_address" value="6"/>                            <!-- defualt device address -->
+        <param name="read_frequency" value="200.0"/>                        <!-- the frequency can custom -->
+        <param name="magnetic_log_dir" value="/home/sunqian/history/loc/Magnetic/" />    <!-- custom -->
     </node>
 </launch>

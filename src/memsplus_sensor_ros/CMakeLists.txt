@@ -43,14 +43,16 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
+include_directories(/usr/include/glog)
+
 add_executable(mprid1356_node src/mprid1356_node.cpp src/mprid1356_driver.cpp)
-target_link_libraries(mprid1356_node ${catkin_LIBRARIES})
+target_link_libraries(mprid1356_node ${catkin_LIBRARIES} glog lzma)
 install(TARGETS mprid1356_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
 add_executable(mpmgs201_node src/mpmgs201_node.cpp src/mpmgs201_driver.cpp)
-target_link_libraries(mpmgs201_node ${catkin_LIBRARIES})
+target_link_libraries(mpmgs201_node ${catkin_LIBRARIES} glog lzma)
 install(TARGETS mpmgs201_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

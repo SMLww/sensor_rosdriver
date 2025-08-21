@@ -3,20 +3,21 @@
 
 #include <ros/ros.h>
 #include <serial/serial.h>
+#include <glog/logging.h>
 #include <mutex>
 #include <geometry_msgs/PoseStamped.h>
 #include <memsplus_sensor_ros/RFIDTag.h>
 
 class Mprid1356_Driver
 {
-private:
-    /* data */
 public:
     Mprid1356_Driver(ros::NodeHandle& nh);
     ~Mprid1356_Driver();
 
-    bool init();        // intial sensor port -- 初始化接口
-    void mainLoop();    // main loop function -- 主循环
+    bool init();        // intial sensor port
+    void mainLoop();    // main loop function
+    
+    std::string rfid_log_dir_;
 
 private:
     void processTagPosition(const std::vector<uint8_t>& response);
@@ -32,6 +33,8 @@ private:
     std::vector<uint8_t> coord_to_bytes(double coord, double precision = 1000.0);
     double bytes_to_coord(const std::vector<uint8_t>& bytes, size_t start = 0, double precision = 1000.0);
     void resetWriteCmdbyte();
+
+    void writeTagToTxt(const std::string& filename, const uint16_t& id, const double& x, const double& y);
 
     uint16_t crc16(const uint8_t* data, size_t len);
 
@@ -57,10 +60,21 @@ private:
     int intial_tag_id_;
     double tag_distance_thr_;
     uint16_t next_tag_id_;
+    uint16_t current_tag_id_;
     bool tag_status_;
+    
     int min_signal_thr_;
     uint8_t set_signal_level_;
     uint8_t current_signal_level_;
+    uint8_t max_signal_level_;
+
+    bool isTriggeredOnce;
+    double old_x, old_y;
+    int wait_count;
+    const int WAIT_THRESHOLD = 10;
+
+    std::string tag_recorde_file_;
+    bool isRecordeTag;
     
     std::vector<double> id_help_pose = {0.0, 0.0};
     
