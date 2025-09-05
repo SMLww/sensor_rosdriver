@@ -2,12 +2,12 @@
 #include<ros/ros.h>
 
 int main(int argc, char** argv){
-    ros::init(argc, argv, "mprid1356_node");
-    ros::NodeHandle nh("~");
-    
-    Mprid1356_Driver driver(nh);
     google::InitGoogleLogging(argv[0]);
     FLAGS_alsologtostderr = 1;
+
+    ros::init(argc, argv, "mprid1356_node");
+    ros::NodeHandle nh("~");
+    Mprid1356_Driver driver(nh);
     google::SetLogDestination(google::GLOG_INFO,(driver.rfid_log_dir_ + "rfid_info").c_str());
     google::SetLogDestination(google::GLOG_FATAL,(driver.rfid_log_dir_ + "rfid_fatal").c_str());
     google::SetLogDestination(google::GLOG_WARNING,(driver.rfid_log_dir_ + "rfid_warning").c_str());

@@ -15,11 +15,13 @@ int main(int argc, char** argv){
     if (!driver.init()){
         LOG(ERROR) << "The magnetic navigation driver failed to initialize";
         ROS_ERROR("The magnetic navigation driver failed to initialize");
+        google::ShutdownGoogleLogging();
         return -1;
     }
     
     LOG(INFO) << "The MPMGS201-F01 device has launched successfully";
     ROS_INFO("The MPMGS201-F01 device has launched successfully");
     driver.mainLoop();
+    google::ShutdownGoogleLogging();
     return 0;
 }

@@ -34,7 +34,7 @@ private:
     double bytes_to_coord(const std::vector<uint8_t>& bytes, size_t start = 0, double precision = 1000.0);
     void resetWriteCmdbyte();
 
-    void writeTagToTxt(const std::string& filename, const uint16_t& id, const double& x, const double& y);
+    void writeTagJson(const std::string& filename, const uint16_t& id, const double& x, const double& y);
 
     uint16_t crc16(const uint8_t* data, size_t len);
 
@@ -73,11 +73,12 @@ private:
     int wait_count;
     const int WAIT_THRESHOLD = 10;
 
+    std::mutex file_mutex_;
     std::string tag_recorde_file_;
-    bool isRecordeTag;
-    
+
     std::vector<double> id_help_pose = {0.0, 0.0};
     
+    std::mutex cmd_mutex_;
 
     // communication command -- 通信指令
     // The data read command -- 数据读取指令

@@ -5,6 +5,6 @@
         <param name="baudrate" value="115200"/>                             <!-- defualt baudrate -->
         <param name="device_address" value="6"/>                            <!-- defualt device address -->
         <param name="read_frequency" value="200.0"/>                        <!-- the frequency can custom -->
-        <param name="magnetic_log_dir" value="/home/sunqian/history/loc/Magnetic/" />    <!-- custom -->
+        <param name="magnetic_log_dir" value="/home/robot/history/loc/Magnetic/" />    <!-- custom -->
     </node>
 </launch>

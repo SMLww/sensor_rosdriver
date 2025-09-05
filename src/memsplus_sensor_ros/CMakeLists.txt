@@ -16,6 +16,11 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
 )
 
+find_package(nlohmann_json 3.2.0 REQUIRED)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -g")
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g") #报内存泄漏错误，malloc
+
 ## Generate messages in the 'msg' folder
 add_message_files(
   FILES
@@ -46,7 +51,7 @@ include_directories(
 include_directories(/usr/include/glog)
 
 add_executable(mprid1356_node src/mprid1356_node.cpp src/mprid1356_driver.cpp)
-target_link_libraries(mprid1356_node ${catkin_LIBRARIES} glog lzma)
+target_link_libraries(mprid1356_node ${catkin_LIBRARIES} nlohmann_json::nlohmann_json glog lzma)
 install(TARGETS mprid1356_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

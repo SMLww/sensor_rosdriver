@@ -1,10 +1,14 @@
 #include"mprid1356_ros/mprid1356_driver.h"
+#include<nlohmann/json.hpp>
+#include<sys/stat.h>
 #include<iostream>
 #include<fstream>
 #include<string>
 
+using json = nlohmann::json;
+
 Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh) {
-    nh.param("port", port_, std::string("/dev/ttS5"));
+    nh.param("port", port_, std::string("/dev/ttyRFID"));
     nh.param("baudrate", baudrate_, 115200);
     nh.param("device_address", dev_addr_, 6);
     nh.param("read_frequency", freq_, 100.0);               // 100 sometimes require each second -- 每秒100次请求
@@ -14,15 +18,17 @@ Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh) {
     nh.param("intial_tag_id", intial_tag_id_, 1);
     nh.param("min_signal_thr", min_signal_thr_, 7);         // recommand setting 1 as min_signal threshold
     nh.param("rfid_log_dir",rfid_log_dir_, std::string("/home/sunqian/history/loc/Rfid/"));
-    nh.param("tag_recorde_file", tag_recorde_file_, std::string("/home/robot/A14.txt"));
+    nh.param("tag_recorde_file", tag_recorde_file_, std::string("/home/sunqian/A14.json"));
 
     current_signal_level_ = 0x00;
     max_signal_level_ = 0x00;
+    offset_y_ = 0.0; pose_x_ = 0.0; pose_y_ = 0.0;
 
     isTriggeredOnce = true;
-    isRecordeTag = true;
     old_x = 0.0;old_y = 0.0;
     wait_count = 0;
+
+    id_help_pose.resize(2, 0.0);
 
     // intial start tag id 
     if (intial_tag_id_ < 0 || intial_tag_id_ > UINT16_MAX) {
@@ -49,16 +55,33 @@ Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh) {
 
     pose_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/pose", 10, &Mprid1356_Driver::poseCallback, this);
     offset_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/mag_offset", 20, &Mprid1356_Driver::offsetCallback, this);
-    tag_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 20); // 
+    tag_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 20);
 }
 
 Mprid1356_Driver::~Mprid1356_Driver() {
     if (serial_.isOpen()) {
-        serial_.close();
+        try {
+            serial_.close();
+            LOG(INFO) << "Rfid port closed on destructor";
+        } catch (serial::IOException& e) {
+            LOG(WARNING) << "Error closing serial port on destructor: " << e.what();
+        }
     }
 }
 
 bool Mprid1356_Driver::init() {
+    if (access(tag_recorde_file_.c_str(), F_OK) != 0 || access(tag_recorde_file_.c_str(), R_OK | W_OK) != 0){
+        std::ofstream ofs(tag_recorde_file_, std::ios::out | std::ios::trunc);
+        if (ofs.is_open()) {
+            ofs << "[]";
+            ofs.close();
+            chmod(tag_recorde_file_.c_str(), 0666);
+        } else {
+            LOG(ERROR) << "Failed to open tag record file: " << tag_recorde_file_;
+            return false;
+        }
+    }
+
     try{
         serial_.setPort(port_);
         serial_.setBaudrate(baudrate_);
@@ -74,7 +97,7 @@ bool Mprid1356_Driver::init() {
 
 void Mprid1356_Driver::mainLoop() {
     ros::Rate rate(freq_);
-    
+
     while (ros::ok()) {
         if (!serial_.isOpen()) {
             LOG(WARNING) << "Rfid port closed, trying to reinit...";
@@ -89,7 +112,7 @@ void Mprid1356_Driver::mainLoop() {
             if(sendCommand(read_cmd_8byte,read_cmd_8byte.size())) {
                 std::string response_str = serial_.read(expected_len);
                 
-                // Explicit conversion - 显式转换
+                // Explicit conversion
                 std::vector<uint8_t> response(response_str.begin(), response_str.end());
                 //printDataContent(response, "The reading command return data:");
                 
@@ -101,7 +124,8 @@ void Mprid1356_Driver::mainLoop() {
                 }
             }
         }
-        else if(available_bytes_ == 4) { // 若后续有需求在此补齐
+        else if(available_bytes_ == 4) {
+            // 若后续有需求可在此补充
         }
         else
             LOG(ERROR) << "The Rfid does not a" << available_bytes_ << "bytes mode. Please correct the available_bytes parameter";    
@@ -138,10 +162,10 @@ void Mprid1356_Driver::processTagPosition(const std::vector<uint8_t>& response) 
         tag_position.pose.position.z = static_cast<double>(current_tag_id_);
         tag_pose_pub.publish(tag_position);
         LOG(INFO) << "Tag id = " << current_tag_id_ << ", Position: x = "
-                << tag_position.pose.position.x << ", y = " << tag_position.pose.position.y;
-        ROS_INFO("Tag id = %hu, Position: x = %.3f, y = %.3f", current_tag_id_, 
-             tag_position.pose.position.x, 
-             tag_position.pose.position.y);
+                << tag_position.pose.position.x << ", y = " << tag_position.pose.position.y
+                << "current signal level = " << current_signal_level_;
+        ROS_INFO("Tag id = %hu, Position: x = %.3f, y = %.3f, current signal level = %hu", current_tag_id_, 
+             tag_position.pose.position.x, tag_position.pose.position.y,current_signal_level_);
         isTriggeredOnce = false;
     }
 }
@@ -153,8 +177,8 @@ void Mprid1356_Driver::processMappingMode() {
     tag_status_ = false; // intial status flag bits
 
     if(current_signal_level_ >= set_signal_level_ && current_signal_level_ >= max_signal_level_) {
-        LOG(INFO) << "current_signal_level = " << current_signal_level_ 
-                << ", max_signal_level_ = " << max_signal_level_;
+        LOG(INFO) << "current_signal_level = " << static_cast<int>(current_signal_level_)
+                << ", max_signal_level_ = " << static_cast<int>(max_signal_level_);
         max_signal_level_ = current_signal_level_;
 
         std::lock_guard<std::mutex> lock(pose_mutex_);
@@ -169,13 +193,26 @@ void Mprid1356_Driver::processMappingMode() {
         build_write_command(next_tag_id_, x_bytes, y_bytes);
         //printDataContent(write_cmd_8byte, "Send writting command data:");
         sendCommand(write_cmd_8byte, write_cmd_8byte.size()); // writting custom 8 bytes data -- 写入8个字节的数据
-        std::string response_str = serial_.read(8);
-        std::vector<uint8_t> response(response_str.begin(), response_str.end());
+
+        std::vector<unsigned char> response;
+        const int READ_LEN = 8;
+        std::string response_str_ = serial_.read(READ_LEN);
+        
+        // 检查读取长度是否符合预期
+        if (response_str_.size() != READ_LEN) {
+            LOG(ERROR) << "Read " << response_str_.size() << " bytes (expected " << READ_LEN << ")";
+            return;
+        }
+        response = std::vector<unsigned char>(response_str_.begin(), response_str_.end());
+        //printDataContent(response, "Reveived writting command data:");
+
         if (response.size() == 8 && response[5] == 0x04) {
             LOG(INFO) << "Tag id = " << next_tag_id_ << " writing success, x = " << current_pose_x 
-                    << " y = " << current_pose_y << ", y direction offset = " << current_offset_y; 
+                    << " y = " << current_pose_y << ", y direction offset = " << current_offset_y;
+            writeTagJson(tag_recorde_file_, next_tag_id_, current_pose_x, current_pose_y + current_offset_y); 
+
             if (std::hypot(id_help_pose[0] - current_pose_x, id_help_pose[1] - current_pose_y) >= tag_distance_thr_) {
-                if (id_help_pose[0] != 0.0 && id_help_pose[0] != 0.0) next_tag_id_ += 3;
+                if (id_help_pose[0] != 0.0 && id_help_pose[1] != 0.0) next_tag_id_ += 3;
                 id_help_pose[0] = current_pose_x;
                 id_help_pose[1] = current_pose_y;
             }
@@ -183,15 +220,12 @@ void Mprid1356_Driver::processMappingMode() {
             resetWriteCmdbyte();
         }else{
             LOG(ERROR) << "Writing failed";
+            return;
         }
-    }
-    else if(isRecordeTag && current_signal_level_ < max_signal_level_){
-        writeTagToTxt(tag_recorde_file_, next_tag_id_, pose_x_, pose_y_ + offset_y_);
-        isRecordeTag = false;
     }
     else{
         if (current_signal_level_ < max_signal_level_) {
-            LOG(INFO) << "Tag Id " << next_tag_id_ << "has complete position writting";
+            LOG(INFO) << "Tag Id " << next_tag_id_ << " has complete position writting";
         }
 
         LOG(WARNING) << "Current tag signal level = " << current_signal_level_ 
@@ -235,7 +269,6 @@ bool Mprid1356_Driver::parseResponse(const std::vector<uint8_t>& data) {
             tag_status_ = false;
             max_signal_level_ = 0x00;
             isTriggeredOnce = true;
-            isRecordeTag = true;
         }
         return false;
     }
@@ -250,9 +283,6 @@ bool Mprid1356_Driver::parseResponse(const std::vector<uint8_t>& data) {
 
     return true;
 }
-
-
-
 
 /**
  * @brief The /pose subscriber Callback main to operat position information
@@ -277,6 +307,11 @@ void Mprid1356_Driver::offsetCallback(const geometry_msgs::PoseStamped::ConstPtr
  * @brief The function constructe 8 bytes writting command only support for now
  */
 void Mprid1356_Driver::build_write_command(uint16_t tag_id, const std::vector<uint8_t>& x_bytes, const std::vector<uint8_t>& y_bytes) {
+    std::lock_guard<std::mutex> lock(cmd_mutex_);
+    if (write_cmd_8byte.size() != 7) {
+        LOG(FATAL) << "write_cmd_8byte size incorrect: " << write_cmd_8byte.size();
+        return;
+    }
     if (write_cmd_8byte.size() == 7 && write_cmd_8byte[6] == 0x08) {
         // 标签编号 - 2字节高位在前
         write_cmd_8byte.push_back((static_cast<uint8_t>((tag_id >> 8) & 0xFF)));
@@ -335,28 +370,88 @@ double Mprid1356_Driver::bytes_to_coord(const std::vector<uint8_t>& bytes, size_
 /**
  * @brief After every writting command is completed, needing it to intial the command
  */
-void Mprid1356_Driver::resetWriteCmdbyte() { 
+void Mprid1356_Driver::resetWriteCmdbyte() {
+    std::lock_guard<std::mutex> lock(cmd_mutex_);
+
+    write_cmd_8byte.clear();
+    write_cmd_4byte.clear();
+
     if(available_bytes_ == 8) {
         write_cmd_8byte = {0x06, 0x10, 0x00, 0x17, 0x00, 0x04, 0x08};
+        //assert(write_cmd_8byte.size() == 7 && "write_cmd_8byte must be 7 bytes");
+        return;
     } 
     else if (available_bytes_ == 4) {
         write_cmd_4byte =  {0x06, 0x10, 0x00, 0x17, 0x00, 0x02, 0x04};
     }
-    else{
-        LOG(ERROR) << "The Rfid does not " << available_bytes_ << " bytes mode.Please correct the available_bytes parameter";
+    else {
+        LOG(ERROR) << "The Rfid does not support " << available_bytes_ << " bytes mode. Please correct the available_bytes parameter";
+        write_cmd_8byte.clear();
+        write_cmd_4byte.clear();
     }
 }
 
-void Mprid1356_Driver::writeTagToTxt(const std::string& filename, const uint16_t& id, const double& x, const double& y) {
-    std::ofstream ofs;
-    ofs.open(filename, std::ios::app);
-    if (!ofs) {
-        LOG(ERROR) << "The file is not open";
-        return ;
+void Mprid1356_Driver::writeTagJson(const std::string& filename, const uint16_t& id, const double& x, const double& y) {
+    std::lock_guard<std::mutex> lock(file_mutex_);
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm local_time;
+    localtime_r(&now_c, &local_time);
+    char time_str[20];
+    std::strftime(time_str, sizeof(time_str), "%Y/%m/%d %H:%M:%S", &local_time);
+    std::string current_time = time_str;
+
+    json json_data;
+    std::ifstream ifs(filename);
+    if (ifs.is_open()) {
+        try {
+            ifs >> json_data;
+            if (!json_data.is_array()) {
+                json_data = json::array();
+                LOG(WARNING) << "Invalid JSON format in " << filename << ", resetting to empty array";
+            }
+        } catch (const json::parse_error& e) {
+            json_data = json::array();
+            LOG(WARNING) << "Failed to parse JSON in " << filename << ": " << e.what() << ", resetting to empty array";
+        }
+        ifs.close();
+    } else {
+        json_data = json::array();
+        LOG(WARNING) << "Failed to open " << filename << " for reading, initializing new array";
     }
-    ofs << id << " " << x << " " << y << std::endl;
-    ofs.close();
-    LOG(INFO)<< "Tag id "<< id << "recorde success!";
+    
+    bool tag_exists = false;
+    for (auto& tag : json_data) {
+        if (tag.contains("id") && tag["id"] == id) {
+            tag["x"] = x;
+            tag["y"] = y;
+            tag["last_updated"] = current_time;
+
+            tag_exists = true;
+            LOG(INFO) << "Updated tag " << id << " in JSON file";
+            break;
+        }
+    } 
+
+    if (!tag_exists) {
+        json new_tag;
+        new_tag["id"] = id;
+        new_tag["x"] = x;
+        new_tag["y"] = y;
+        new_tag["first_added"] = current_time;
+        new_tag["last_updated"] = current_time;
+        json_data.push_back(new_tag);
+        LOG(INFO) << "Added new tag " << id << " to JSON file";
+    }
+
+    std::ofstream ofs(filename, std::ios::out | std::ios::trunc);
+    if (ofs.is_open()) {
+        ofs << std::setw(4) << json_data << std::endl;
+        ofs.close();
+    } else {
+        LOG(ERROR) << "Failed to open " << filename << " for writing";
+    }
 }
 
 /**

@@ -1,14 +1,14 @@
 <launch>
+    <arg name="debug" default="false" doc="Enable GDB debugging"/>
+
     <!-- defines the ability to rewrite parameters -->
     <arg name="mapping_mode" default="false" doc="Enable mapping mode"/>
     <arg name="initial_id" default="1" doc="Enable initial id"/>
     <arg name="distance_thr" default="1.0" doc="Enable to help id increment"/>
     <arg name="signal_thr" default="7" doc="Enable min RSSi writting threshold"/>
     
-  
-    <node name="mprid1356_node" pkg="memsplus_sensor_ros" type="mprid1356_node" 
-        launch-prefix="bash -c 'chmod 666 /dev/ttyS5; $0 $@'" output="screen">
-        <param name="port" value="/dev/ttyS5"/>
+    <node name="mprid1356_node" pkg="memsplus_sensor_ros" type="mprid1356_node" output="screen" launch-prefix="$(eval 'gnome-terminal -x gdb -args' if debug else '')" >
+        <param name="port" value="/dev/ttyRFID"/>
         <param name="baudrate" value="115200"/>                         <!-- defualt baudrate -->
         <param name="device_address" value="6"/>                        <!-- defualt device address -->
         <param name="read_frequency" value="100.0"/>                    <!-- the frequency can custom -->
@@ -17,7 +17,7 @@
         <param name="intial_tag_id" value="$(arg initial_id)" />        <!-- customization intial tag id-->
         <param name="tag_distance_thr" value="$(arg distance_thr)" />   <!-- customization both tag writer distance constraint -->
         <param name="min_signal_thr" value="$(arg signal_thr)" />       <!-- customization min tag signal threshold-->
-        <param name="rfid_log_dir" value="/home/sunqian/history/loc/Rfid/" />     
-        <param name="tag_recorde_file" value="/home/robot/A14_gudao.txt" />  
+        <param name="rfid_log_dir" value="/home/sunqian/history/Rfid/" />     
+        <param name="tag_recorde_file" value="/home/sunqian/A14.json" />  
     </node>
 </launch>
