@@ -1,9 +1,12 @@
 #include"mprid1356_ros/mprid1356_driver.h"
-#include<nlohmann/json.hpp>
-#include<sys/stat.h>
-#include<iostream>
-#include<fstream>
-#include<string>
+
+
+#include <fstream>
+#include <unistd.h>
+#include <iostream>
+#include <sys/stat.h>
+#include <sys/inotify.h>
+#include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
 
@@ -11,54 +14,30 @@ Mprid1356_Driver::Mprid1356_Driver(ros::NodeHandle& nh) {
     nh.param("port", port_, std::string("/dev/ttyRFID"));
     nh.param("baudrate", baudrate_, 115200);
     nh.param("device_address", dev_addr_, 6);
-    nh.param("read_frequency", freq_, 100.0);               // 100 sometimes require each second -- 每秒100次请求
+    nh.param("read_frequency", freq_, 100.0);               // 100 sometimes require each second
     nh.param("available_bytes", available_bytes_, 8);
-    nh.param("is_mapping_mode", is_mapping_mode_, false);   // default false -> location -- 默认定位模式
+    nh.param("is_mapping_mode", is_mapping_mode_, false);   // default false -> location
+    nh.param("is_addition_mode", is_addition_mode_, false);   // default false -> regular mode
     nh.param("tag_distance_thr", tag_distance_thr_, 1.0);   // tag id help distance threshold
     nh.param("intial_tag_id", intial_tag_id_, 1);
     nh.param("min_signal_thr", min_signal_thr_, 7);         // recommand setting 1 as min_signal threshold
-    nh.param("rfid_log_dir",rfid_log_dir_, std::string("/home/sunqian/history/loc/Rfid/"));
+    nh.param("rfid_log_dir",rfid_log_dir_, std::string("/home/sunqian/history/Rfid/"));
     nh.param("tag_recorde_file", tag_recorde_file_, std::string("/home/sunqian/A14.json"));
 
-    current_signal_level_ = 0x00;
-    max_signal_level_ = 0x00;
-    offset_y_ = 0.0; pose_x_ = 0.0; pose_y_ = 0.0;
-
-    isTriggeredOnce = true;
-    old_x = 0.0;old_y = 0.0;
-    wait_count = 0;
-
-    id_help_pose.resize(2, 0.0);
-
-    // intial start tag id 
-    if (intial_tag_id_ < 0 || intial_tag_id_ > UINT16_MAX) {
-        LOG(WARNING) << "Invalid tag ID value: " << intial_tag_id_ << ". Using default 0x0001.";
-        next_tag_id_ = 0x0001;
-    } else {
-        next_tag_id_ = static_cast<uint16_t>(intial_tag_id_);
-    }
-
-    // intial min tag signal threshold
-    if (min_signal_thr_ < 0 || min_signal_thr_ > 7) {
-        LOG(WARNING) << "Invalid min signal threshold value: " << min_signal_thr_ << ". Using default 0x07.";
-        set_signal_level_ = 0x07;
-    } else {
-        set_signal_level_ = static_cast<uint8_t>(min_signal_thr_);
-    }
-
-    // output runing mode to screen
-    if (is_mapping_mode_) {
-        LOG(INFO) << "Mapping mode";
-    }else{
-        LOG(INFO) << "Location mode";
-    }
-
-    pose_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/pose", 10, &Mprid1356_Driver::poseCallback, this);
-    offset_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/mag_offset", 20, &Mprid1356_Driver::offsetCallback, this);
-    tag_pose_pub = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 20);
+    // Initialize all parameters and setup publishers/subscribers
+    initializeParameters(nh);
 }
 
 Mprid1356_Driver::~Mprid1356_Driver() {
+    // remove inotify watch
+    if (watch_fd_ != -1) {
+        inotify_rm_watch(inotify_fd_, watch_fd_);
+    }
+    // close inotify fd
+    if (inotify_fd_ != -1) {
+        close(inotify_fd_);
+    }
+
     if (serial_.isOpen()) {
         try {
             serial_.close();
@@ -70,18 +49,18 @@ Mprid1356_Driver::~Mprid1356_Driver() {
 }
 
 bool Mprid1356_Driver::init() {
-    if (access(tag_recorde_file_.c_str(), F_OK) != 0 || access(tag_recorde_file_.c_str(), R_OK | W_OK) != 0){
-        std::ofstream ofs(tag_recorde_file_, std::ios::out | std::ios::trunc);
-        if (ofs.is_open()) {
-            ofs << "[]";
-            ofs.close();
-            chmod(tag_recorde_file_.c_str(), 0666);
-        } else {
-            LOG(ERROR) << "Failed to open tag record file: " << tag_recorde_file_;
-            return false;
-        }
+    // get tag record file name, through /.ros/map id.txt
+    std::string map_id = getMapID();
+    current_map_id_ = map_id;
+    tag_recorde_file_ = map_id.empty() ? tag_recorde_file_ : map_id + ".json";
+
+    // check tag record file
+    if (!initTagRecordFile(tag_recorde_file_)) {
+        LOG(ERROR) << "Failed to initialize tag record file";
+        return false;
     }
 
+    // init serial port;include baudrate, port, timeout
     try{
         serial_.setPort(port_);
         serial_.setBaudrate(baudrate_);
@@ -96,13 +75,40 @@ bool Mprid1356_Driver::init() {
 }
 
 void Mprid1356_Driver::mainLoop() {
-    ros::Rate rate(freq_);
+    ros::Rate rate(freq_); // defualt 100 Hz
+    const int EVENT_SIZE = sizeof(struct inotify_event);
+    const int BUF_LEN = 1024 * (EVENT_SIZE + 16);
+    char buffer[BUF_LEN];
 
     while (ros::ok()) {
+        // check map id change
+        ssize_t length = read(inotify_fd_, buffer, BUF_LEN);
+        if (length > 0) {
+            int i = 0;
+            while (i < length) {
+                struct inotify_event *event = (struct inotify_event *) &buffer[i];
+                if (event->mask & IN_MODIFY) {
+                    std::string new_map_id = getMapID();
+                    if (new_map_id != current_map_id_) {
+                        LOG(INFO) << "Map ID changed from " << current_map_id_ << " to " << new_map_id;
+                        current_map_id_ = new_map_id;
+                        tag_recorde_file_ = new_map_id.empty() ? tag_recorde_file_ : new_map_id + ".json";
+
+                        if (!initTagRecordFile(tag_recorde_file_)) {
+                            LOG(ERROR) << "Failed to initialize tag record file";
+                            continue;
+                        }
+                    }
+                }
+                i += EVENT_SIZE + event->len; 
+            }
+        }
+
+        // check serial port status；if closed, try to reinit
         if (!serial_.isOpen()) {
             LOG(WARNING) << "Rfid port closed, trying to reinit...";
             if (!init()) {
-                ros::Duration(1).sleep();
+                ros::Duration(1).sleep(); // sleep for 1 second
                 continue;
             }
         }
@@ -125,133 +131,82 @@ void Mprid1356_Driver::mainLoop() {
             }
         }
         else if(available_bytes_ == 4) {
-            // 若后续有需求可在此补充
+            // if future need can be added here
         }
-        else
-            LOG(ERROR) << "The Rfid does not a" << available_bytes_ << "bytes mode. Please correct the available_bytes parameter";    
-        
+        else {
+            LOG(ERROR) << "The Rfid does not a" << available_bytes_ << "bytes mode. Please correct the available_bytes parameter";
+        }
+            
         ros::spinOnce();
         rate.sleep();
     }
 }
 
-/**
- * @brief The location mode setting main process, only support 8 byte for now
- */
-void Mprid1356_Driver::processTagPosition(const std::vector<uint8_t>& response) {
-    geometry_msgs::PoseStamped tag_position;
+void Mprid1356_Driver::initializeParameters(ros::NodeHandle& nh) {
+    // Initialize signal levels
+    current_signal_level_ = 0x00;
+    max_signal_level_ = 0x00;
+
+    // Initialize pose and offset values
+    pose_x_ = 0.0; 
+    pose_y_ = 0.0; 
+    offset_y_ = 0.0; 
+
+    // Initialize trigger and position tracking
+    isTriggeredOnce = true;
+    old_x = 0.0;
+    old_y = 0.0;
+    wait_count = 0;
+
+    // Initialize ID help pose
+    id_help_pose.resize(2, 0.0);
+
+    // Initialize start tag ID with validation
+    if (intial_tag_id_ < 0 || intial_tag_id_ > UINT16_MAX) {
+        LOG(WARNING) << "Invalid tag ID value: " << intial_tag_id_ << ". Using default 0x0001.";
+        write_tag_id_ = 0x0001;
+    } else {
+        write_tag_id_ = static_cast<uint16_t>(intial_tag_id_);
+    }
+
+    // Initialize min tag signal threshold with validation
+    if (min_signal_thr_ < 0 || min_signal_thr_ > 7) {
+        LOG(WARNING) << "Invalid min signal threshold value: " << min_signal_thr_ << ". Using default 0x07.";
+        set_signal_level_ = 0x07;
+    } else {
+        set_signal_level_ = static_cast<uint8_t>(min_signal_thr_);
+    }
+
+    // Output running mode to screen
+    if (is_mapping_mode_) {
+        LOG(INFO) << "Mapping mode";
+    } else {
+        LOG(INFO) << "Location mode";
+    }
     
-    uint16_t crc_received = (response[13] << 8) | response[14];
-    uint16_t crc_calculated = crc16(response.data(), 13);
-    
-    if (crc_received != crc_calculated) {
-        LOG(ERROR) << "Verification failed";
+    // Initialize inotify for map_id.txt file
+    inotify_fd_ = inotify_init1(IN_NONBLOCK);
+    if (inotify_fd_ == -1) {
+        LOG(ERROR) << "Failed to initialize inotify";
+        return;
     }
-    // LOG(INFO) << "Verification success";
-    
-    if (current_signal_level_ >= max_signal_level_) {
-        max_signal_level_ = current_signal_level_;
-        old_x = bytes_to_coord(response, 7);
-        old_y = bytes_to_coord(response, 10);
+    // Initialize watch for map_id.txt file
+    std::string map_id_path = std::string(std::getenv("HOME")) + "/.ros/map_id.txt";
+    watch_fd_ = inotify_add_watch(inotify_fd_, map_id_path.c_str(), IN_MODIFY);
+    if (watch_fd_ == -1) {
+        LOG(ERROR) << "Failed to add watch for map_id.txt file";
+        close(inotify_fd_);
+        return;
     }
-    else if (isTriggeredOnce && current_signal_level_ < max_signal_level_) {
-        // in theory, it is 10 mm motion error
-        tag_position.header.stamp = ros::Time::now();
-        tag_position.pose.position.x = old_x;
-        tag_position.pose.position.y = old_y;
-        tag_position.pose.position.z = static_cast<double>(current_tag_id_);
-        tag_pose_pub.publish(tag_position);
-        LOG(INFO) << "Tag id = " << current_tag_id_ << ", Position: x = "
-                << tag_position.pose.position.x << ", y = " << tag_position.pose.position.y
-                << "current signal level = " << current_signal_level_;
-        ROS_INFO("Tag id = %hu, Position: x = %.3f, y = %.3f, current signal level = %hu", current_tag_id_, 
-             tag_position.pose.position.x, tag_position.pose.position.y,current_signal_level_);
-        isTriggeredOnce = false;
-    }
-}
 
-/**
- * @brief The mapping mode setting main process, only support 8 byte for now
- */
-void Mprid1356_Driver::processMappingMode() {
-    tag_status_ = false; // intial status flag bits
+    // Initialize Publishers
+    tag_pose_pub_ = nh.advertise<geometry_msgs::PoseStamped>("/tag_pose", 20);
 
-    if(current_signal_level_ >= set_signal_level_ && current_signal_level_ >= max_signal_level_) {
-        LOG(INFO) << "current_signal_level = " << static_cast<int>(current_signal_level_)
-                << ", max_signal_level_ = " << static_cast<int>(max_signal_level_);
-        max_signal_level_ = current_signal_level_;
+    // Initialize Subscribers
+    mode_sub_ = nh.subscribe("/toggle_mapping_mode", 10, &Mprid1356_Driver::modeCallback, this);
+    pose_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/pose", 10, &Mprid1356_Driver::poseCallback, this);
+    offset_sub_ = nh.subscribe<geometry_msgs::PoseStamped>("/mag_offset", 20, &Mprid1356_Driver::offsetCallback, this);
 
-        std::lock_guard<std::mutex> lock(pose_mutex_);
-        double current_pose_x = pose_x_;
-        double current_pose_y = pose_y_;
-
-        std::lock_guard<std::mutex> mag_lock(mag_mutex_);
-        double current_offset_y = offset_y_;
-
-        auto x_bytes = coord_to_bytes(current_pose_x);
-        auto y_bytes = coord_to_bytes(current_pose_y + current_offset_y); // correct the Y axis offset
-        build_write_command(next_tag_id_, x_bytes, y_bytes);
-        //printDataContent(write_cmd_8byte, "Send writting command data:");
-        sendCommand(write_cmd_8byte, write_cmd_8byte.size()); // writting custom 8 bytes data -- 写入8个字节的数据
-
-        std::vector<unsigned char> response;
-        const int READ_LEN = 8;
-        std::string response_str_ = serial_.read(READ_LEN);
-        
-        // 检查读取长度是否符合预期
-        if (response_str_.size() != READ_LEN) {
-            LOG(ERROR) << "Read " << response_str_.size() << " bytes (expected " << READ_LEN << ")";
-            return;
-        }
-        response = std::vector<unsigned char>(response_str_.begin(), response_str_.end());
-        //printDataContent(response, "Reveived writting command data:");
-
-        if (response.size() == 8 && response[5] == 0x04) {
-            LOG(INFO) << "Tag id = " << next_tag_id_ << " writing success, x = " << current_pose_x 
-                    << " y = " << current_pose_y << ", y direction offset = " << current_offset_y;
-            writeTagJson(tag_recorde_file_, next_tag_id_, current_pose_x, current_pose_y + current_offset_y); 
-
-            if (std::hypot(id_help_pose[0] - current_pose_x, id_help_pose[1] - current_pose_y) >= tag_distance_thr_) {
-                if (id_help_pose[0] != 0.0 && id_help_pose[1] != 0.0) next_tag_id_ += 3;
-                id_help_pose[0] = current_pose_x;
-                id_help_pose[1] = current_pose_y;
-            }
-            offset_y_ = 0.0;
-            resetWriteCmdbyte();
-        }else{
-            LOG(ERROR) << "Writing failed";
-            return;
-        }
-    }
-    else{
-        if (current_signal_level_ < max_signal_level_) {
-            LOG(INFO) << "Tag Id " << next_tag_id_ << " has complete position writting";
-        }
-
-        LOG(WARNING) << "Current tag signal level = " << current_signal_level_ 
-                << ", doese not meet writting requirements min signal threshold = " << min_signal_thr_;
-    }
-}
-
-/**
- * @brief Towards serial send operation command
- */
-bool Mprid1356_Driver::sendCommand(const std::vector<uint8_t> command, const std::vector<uint8_t>::size_type size) {
-    return serial_.write(command) == size;
-}
-
-/**
- * @brief Printing data content
- * @param start set the frist position，default = 0
- */
-void Mprid1356_Driver::printDataContent(const std::vector<uint8_t> data, const std::string prefix, size_t start) {
-    std::stringstream ss;
-    ss << prefix << ": ";
-    for (size_t i = start; i < data.size(); ++i) {
-        ss << "0x" << std::hex << std::setw(2) << std::setfill('0') 
-           << static_cast<int>(data[i]) << std::dec;
-    }
-    ROS_INFO("%s", ss.str().c_str());
 }
 
 /**
@@ -269,15 +224,17 @@ bool Mprid1356_Driver::parseResponse(const std::vector<uint8_t>& data) {
             tag_status_ = false;
             max_signal_level_ = 0x00;
             isTriggeredOnce = true;
+            current_tag_id_ = 0x0000; // reset tag id
         }
         return false;
     }
 
+    // Reading state (data length == 15 bytes , or status byte is 0x01)
     wait_count = 0;
-    tag_status_ = true;                 // reading staus
-    current_tag_id_ = data[5] << 8 | data[6];
-    current_signal_level_ = data[4];    // current tag signal intensity (RSSI)
-    //LOG(INFO) << "cureent signal level" << current_signal_level_;
+    tag_status_ = true;                         // tag is in reading state
+    current_tag_id_ = data[5] << 8 | data[6];   // current tag id
+    current_signal_level_ = data[4];            // current signal level
+    // LOG(INFO) << "cureent signal level" << static_cast<int>(current_signal_level_);
 
     if (is_mapping_mode_) return false;
 
@@ -285,22 +242,135 @@ bool Mprid1356_Driver::parseResponse(const std::vector<uint8_t>& data) {
 }
 
 /**
- * @brief The /pose subscriber Callback main to operat position information
+ * @brief The location mode setting main process, only support 8 byte for now
  */
-void Mprid1356_Driver::poseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-    std::lock_guard<std::mutex> lock(pose_mutex_);
-    pose_x_ = msg->pose.position.x;
-    pose_y_ = msg->pose.position.y;
-    // ROS_INFO("x =  %lf, y = %lf", msg->pose.position.x, msg->pose.position.y);
+void Mprid1356_Driver::processTagPosition(const std::vector<uint8_t>& response) {
+    tag_status_ = false; // intial status flag bits
+
+    geometry_msgs::PoseStamped tag_position;
+    uint16_t crc_received = (response[13] << 8) | response[14];
+    uint16_t crc_calculated = crc16(response.data(), 13);
+    
+    if (crc_received != crc_calculated) {
+        LOG(ERROR) << "Verification failed";
+        return;
+    }
+    // LOG(INFO) << "Verification success";
+    
+    if (current_signal_level_ >= max_signal_level_) {
+        max_signal_level_ = current_signal_level_;
+        old_x = bytes_to_coord(response, 7);    // 7, 8, 9 -- x
+        old_y = bytes_to_coord(response, 10);   // 10, 11, 12 -- y
+    }
+    else if (isTriggeredOnce && current_signal_level_ < max_signal_level_) {
+        // check the current tag id is in the record file
+        if (isTagExists(tag_recorde_file_,current_tag_id_)){
+            // in theory, it is 10 mm motion error
+            tag_position.header.stamp = ros::Time::now();
+            tag_position.pose.position.x = old_x;
+            tag_position.pose.position.y = old_y;
+            tag_position.pose.position.z = static_cast<double>(current_tag_id_);
+            tag_pose_pub_.publish(tag_position);
+            LOG(INFO) << "Tag id = " << current_tag_id_ << ", Position: x = "
+                    << tag_position.pose.position.x << ", y = " << tag_position.pose.position.y
+                    << "current signal level = " << current_signal_level_;
+        } else {
+            LOG(ERROR) << "Tag id = " << current_tag_id_ << " is not in the record file" << tag_recorde_file_;
+        }
+
+        isTriggeredOnce = false;
+    }
 }
 
 /**
- * @brief The /mag_offset subscriber Callback main to correct Y axis offset value
+ * @brief The mapping mode setting main process, only support 8 byte for now
  */
-void Mprid1356_Driver::offsetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-    std::lock_guard<std::mutex> lock(mag_mutex_);
-    offset_y_ = msg->pose.position.y;
-    // ROS_INFO("Y axis offset =  %lf", offset_y_);
+void Mprid1356_Driver::processMappingMode() {
+    tag_status_ = false; // intial status flag bits
+
+    if (current_signal_level_ >= set_signal_level_ && current_signal_level_ >= max_signal_level_) {
+        LOG(INFO) << "current_signal_level = " << static_cast<int>(current_signal_level_)
+                << ", max_signal_level_ = " << static_cast<int>(max_signal_level_);
+        max_signal_level_ = current_signal_level_;
+
+        std::lock_guard<std::mutex> lock(pose_mutex_);
+        double current_pose_x = pose_x_;
+        double current_pose_y = pose_y_;
+
+        std::lock_guard<std::mutex> mag_lock(mag_mutex_);
+        double current_offset_y = offset_y_;
+
+        auto x_bytes = coord_to_bytes(current_pose_x);
+        auto y_bytes = coord_to_bytes(current_pose_y + current_offset_y);
+
+        build_write_command(write_tag_id_, x_bytes, y_bytes);
+        //printDataContent(write_cmd_8byte, "Send writting command data:");
+        sendCommand(write_cmd_8byte, write_cmd_8byte.size()); // writting custom 8 bytes data -- 写入8个字节的数据
+
+        std::vector<unsigned char> response;
+        const int READ_LEN = 8;
+        std::string response_str_ = serial_.read(READ_LEN);
+        
+        // check the length of the read data is as expected
+        if (response_str_.size() != READ_LEN) {
+            LOG(ERROR) << "Read " << response_str_.size() << " bytes (expected " << READ_LEN << ")";
+            return;
+        }
+        response = std::vector<unsigned char>(response_str_.begin(), response_str_.end());
+        //printDataContent(response, "Reveived writting command data:");
+
+        if (response.size() == 8 && response[5] == 0x04) {
+            LOG(INFO) << "Tag id = " << write_tag_id_ << " writing success, x = " << current_pose_x 
+                    << " y = " << current_pose_y << ", y direction offset = " << current_offset_y;
+            writeTagJson(tag_recorde_file_, write_tag_id_, current_pose_x, current_pose_y + current_offset_y); 
+
+            if (std::hypot(id_help_pose[0] - current_pose_x, id_help_pose[1] - current_pose_y) >= tag_distance_thr_) {
+                if (id_help_pose[0] != 0.0 && id_help_pose[1] != 0.0 && is_addition_mode_) {
+                    write_tag_id_ += 3;
+                } else {
+                    write_tag_id_ += 1;
+                }
+                id_help_pose[0] = current_pose_x;
+                id_help_pose[1] = current_pose_y;
+            }
+            offset_y_ = 0.0;
+        } else {
+            LOG(ERROR) << "Writing failed";
+            return;
+        }
+    }
+    else{
+        if (current_signal_level_ < max_signal_level_) {
+            LOG(INFO) << "Tag Id " << write_tag_id_ << " has complete position writting";
+        }
+        LOG(WARNING) << "Current tag signal level = " << static_cast<int>(current_signal_level_)
+                << ", doese not meet writting requirements min signal threshold = " << static_cast<int>(set_signal_level_);
+    }
+}
+
+/**
+ * @brief After every writting command is completed, needing it to intial the command
+ */
+void Mprid1356_Driver::resetWriteCmdbyte() {
+    std::lock_guard<std::mutex> lock(cmd_mutex_);
+
+    if(available_bytes_ == 8) {
+        write_cmd_8byte = {0x06, 0x10, 0x00, 0x17, 0x00, 0x04, 0x08};
+    } 
+    else if (available_bytes_ == 4) {
+        write_cmd_4byte =  {0x06, 0x10, 0x00, 0x17, 0x00, 0x02, 0x04};
+    }
+    else {
+        LOG(ERROR) << "The Rfid does not support " << available_bytes_ << " bytes mode. Please correct the available_bytes parameter";
+    }
+}
+
+/**
+ * @brief Towards serial send operation command
+ */
+bool Mprid1356_Driver::sendCommand(const std::vector<uint8_t> command, const std::vector<uint8_t>::size_type size) {
+    std::lock_guard<std::mutex> serial_lock(serial_mutex_);
+    return serial_.write(command) == size;
 }
 
 /**
@@ -308,6 +378,7 @@ void Mprid1356_Driver::offsetCallback(const geometry_msgs::PoseStamped::ConstPtr
  */
 void Mprid1356_Driver::build_write_command(uint16_t tag_id, const std::vector<uint8_t>& x_bytes, const std::vector<uint8_t>& y_bytes) {
     std::lock_guard<std::mutex> lock(cmd_mutex_);
+    resetWriteCmdbyte();
     if (write_cmd_8byte.size() != 7) {
         LOG(FATAL) << "write_cmd_8byte size incorrect: " << write_cmd_8byte.size();
         return;
@@ -340,8 +411,10 @@ void Mprid1356_Driver::build_write_command(uint16_t tag_id, const std::vector<ui
 std::vector<uint8_t> Mprid1356_Driver::coord_to_bytes(double coord, double precision) {
     // 1. double to int ,the precision is 0.001 - keep three decimal places
     int32_t val = static_cast<int32_t>(coord * precision);
+
     // 2. offset operation to confirm plus-mins(±)
     uint32_t offset_val = val + 0x800000;
+
     // 3. reconstruction 3 byte to save
     return {
         static_cast<uint8_t>((offset_val >> 16) & 0xFF),
@@ -356,41 +429,160 @@ std::vector<uint8_t> Mprid1356_Driver::coord_to_bytes(double coord, double preci
  */
 double Mprid1356_Driver::bytes_to_coord(const std::vector<uint8_t>& bytes, size_t start, double precision) {
     // 1. combine 3 byte to constructe a uint32_t data type
-    uint32_t offset_val = (static_cast<uint32_t>(bytes[start]) << 16)       // 第1字节（高位）
-                        | (static_cast<uint32_t>(bytes[start + 1]) << 8)    // 第2字节
-                        | static_cast<uint32_t>(bytes[start + 2]);          // 第3字节（低位）
+    uint32_t offset_val = (static_cast<uint32_t>(bytes[start]) << 16)       // the first byte, highest
+                        | (static_cast<uint32_t>(bytes[start + 1]) << 8)    // the second byte, middle
+                        | static_cast<uint32_t>(bytes[start + 2]);          // the third byte, lowest
     
     // 2. minus offset to restore negative number
     int32_t val = static_cast<int32_t>(offset_val) - 0x800000;
     
-    // 3. uint32_t exchange double , keep three decimal places
+    // 3. precision operation to get the double type coord information
+    if (precision == 0.0) {
+        LOG(ERROR) << "Precision cannot be zero";
+        return 0.0;
+    }
     return static_cast<float>(val) / precision;
 }
 
-/**
- * @brief After every writting command is completed, needing it to intial the command
- */
-void Mprid1356_Driver::resetWriteCmdbyte() {
-    std::lock_guard<std::mutex> lock(cmd_mutex_);
-
-    write_cmd_8byte.clear();
-    write_cmd_4byte.clear();
-
-    if(available_bytes_ == 8) {
-        write_cmd_8byte = {0x06, 0x10, 0x00, 0x17, 0x00, 0x04, 0x08};
-        //assert(write_cmd_8byte.size() == 7 && "write_cmd_8byte must be 7 bytes");
-        return;
-    } 
-    else if (available_bytes_ == 4) {
-        write_cmd_4byte =  {0x06, 0x10, 0x00, 0x17, 0x00, 0x02, 0x04};
+std::string Mprid1356_Driver::getMapID(const std::string& path) {
+    std::string default_path = std::getenv("HOME") ? std::getenv("HOME") : "";
+    default_path += "/.ros/map_id.txt";
+    
+    std::string file_path = path.empty() ? default_path : path;
+    
+    LOG(INFO) << "map id path = " << file_path;
+    
+    std::ifstream infile(file_path);
+    if (!infile.is_open()) {
+        LOG(ERROR) << "Failed to open map_id file: " << file_path;
+        return "";
     }
-    else {
-        LOG(ERROR) << "The Rfid does not support " << available_bytes_ << " bytes mode. Please correct the available_bytes parameter";
-        write_cmd_8byte.clear();
-        write_cmd_4byte.clear();
+
+    std::map<std::string, std::string> map_scope;
+    std::string str_line, map_id;
+    
+    try {
+        while (getline(infile, str_line)) {
+            if (str_line.empty()) continue;
+            
+            size_t position = str_line.find(": ");
+            if (position == std::string::npos) {
+                LOG(WARNING) << "Invalid line format in map_id file: " << str_line;
+                continue;
+            }
+            
+            map_scope.insert({
+                str_line.substr(0, position),
+                str_line.substr(position + 2)
+            });
+        }
+        
+        if (map_scope.find("map_id") != map_scope.end()) {
+            map_id = map_scope.at("map_id");
+            LOG(INFO) << "read map_id: " << map_id;
+        } else {
+            LOG(ERROR) << "map_id not found in configuration file";
+            return "";
+        }
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Error parsing map_id file: " << e.what();
+        return "";
     }
+    
+    return map_id;
 }
 
+/**
+ * @brief The function to check the tag record file is exist or not
+ * @note If the file does not exist, it will be created and initialized with an empty array
+ * @note If the file exists but is not readable or writable, it will be set to readable and writable
+ * @return true if the file is exist and ready to use, otherwise false
+ */
+bool Mprid1356_Driver::initTagRecordFile(const std::string& file_name){
+    std::string ros_dir = std::getenv("HOME") ? std::getenv("HOME") : "";
+    if (ros_dir.empty()) {
+        LOG(ERROR) << "Cannot get HOME directory";
+        return false;
+    }
+
+    ros_dir += "/.ros/tag_jsons/";
+    std::string dir_path = ros_dir;
+    if (access(dir_path.c_str(), F_OK) != 0) {
+        LOG(INFO) << "Creating directory: " << dir_path;
+        if (mkdir(dir_path.c_str(), 0777) != 0) {
+            LOG(ERROR) << "Failed to create directory: " << dir_path;
+            return false;
+        }
+    }
+
+    std::string path = file_name.empty() ? path : ros_dir + file_name ;
+    if (access(path.c_str(), F_OK) != 0) {
+        LOG(ERROR) << "Tag record file does not exist: " << path;
+        std::ofstream ofs(path, std::ios::out | std::ios::trunc);
+        if (ofs.is_open()) {
+            ofs << "[]";
+            ofs.close();
+            chmod(path.c_str(), 0666);
+        } else {
+            LOG(ERROR) << "Failed to open tag record file: " << path;
+            return false;
+        }
+    } else {
+        if ((access(path.c_str(), R_OK | W_OK) != 0)) {
+            LOG(ERROR) << "Tag record file is not readable/writable: " << path;
+            if (chmod(path.c_str(), 0666) != 0) {
+                LOG(ERROR) << "Failed to set tag record file permissions: " << path;   
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Check if a tag ID exists in the tag record file
+ * @param filename The path to the JSON tag record file
+ * @param tag_id The tag ID to check for existence
+ * @return true if the tag ID exists in the file, false otherwise
+ */
+bool Mprid1356_Driver::isTagExists(const std::string& filename, const uint16_t& tag_id) {
+    std::ifstream ifs(filename);
+    if (!ifs.is_open()) {
+        LOG(WARNING) << "Failed to open " << filename << " for reading";
+        return false;
+    }
+    
+    try {
+        json json_data;
+        ifs >> json_data;
+        ifs.close();
+        
+        // ensoure JSON data is array type
+        if (!json_data.is_array()) {
+            LOG(WARNING) << "Invalid JSON format in " << filename << ", expected array";
+            return false;
+        }
+        
+        // check current tag id is exist or not
+        for (const auto& tag : json_data) {
+            if (tag.contains("id") && tag["id"] == tag_id) {
+                return true;
+            }
+        }
+    } catch (const json::parse_error& e) {
+        LOG(WARNING) << "Failed to parse JSON in " << filename << ": " << e.what();
+        ifs.close();
+        return false;
+    }
+    
+    return false;
+}
+
+/**
+ * @brief The function to write the tag information to json file
+ * @param filename the json file name
+ * @note The json file is a array type, each tag information is a json object
+ */
 void Mprid1356_Driver::writeTagJson(const std::string& filename, const uint16_t& id, const double& x, const double& y) {
     std::lock_guard<std::mutex> lock(file_mutex_);
 
@@ -451,6 +643,58 @@ void Mprid1356_Driver::writeTagJson(const std::string& filename, const uint16_t&
         ofs.close();
     } else {
         LOG(ERROR) << "Failed to open " << filename << " for writing";
+    }
+}
+
+/**
+ * @brief Printing data content
+ * @param start set the frist position，default = 0
+ */
+void Mprid1356_Driver::printDataContent(const std::vector<uint8_t> data, const std::string prefix, size_t start) {
+    std::stringstream ss;
+    ss << prefix << ": ";
+    for (size_t i = start; i < data.size(); ++i) {
+        ss << "0x" << std::hex << std::setw(2) << std::setfill('0') 
+           << static_cast<int>(data[i]) << std::dec;
+    }
+    ROS_INFO("%s", ss.str().c_str());
+}
+
+/**
+ * @brief The /pose subscriber Callback main to operat position information
+ */
+void Mprid1356_Driver::poseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(pose_mutex_);
+    pose_x_ = msg->pose.position.x;
+    pose_y_ = msg->pose.position.y;
+    // ROS_INFO("x =  %lf, y = %lf", msg->pose.position.x, msg->pose.position.y);
+}
+
+/**
+ * @brief The /mag_offset subscriber Callback main to correct Y axis offset value
+ */
+void Mprid1356_Driver::offsetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(mag_mutex_);
+    offset_y_ = msg->pose.position.y;
+    // ROS_INFO("Y axis offset =  %lf", offset_y_);
+}
+
+/**
+ * @brief The /mapping_mode subscriber Callback main to change the mapping mode
+ */
+void Mprid1356_Driver::modeCallback(const std_msgs::Bool::ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(mode_mutex_);
+    if (is_mapping_mode_ != msg->data) {
+        ROS_INFO("Mapping mode changed via topic: %s", 
+                 is_mapping_mode_ ? "true" : "false");
+    } else {
+        ROS_INFO("Mapping mode is already %s", 
+                 is_mapping_mode_ ? "true" : "false");
+    }
+    if (is_mapping_mode_) {
+        LOG(INFO) << "Mapping mode";
+    } else {
+        LOG(INFO) << "Location mode";
     }
 }
 

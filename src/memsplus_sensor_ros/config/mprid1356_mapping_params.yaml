@@ -1,0 +1,30 @@
+# MPRID1356 传感器配置参数
+# =============================
+
+# 串口通信配置
+serial:
+  port: "/dev/ttyRFID"
+  baudrate: 115200
+  device_address: 6
+
+# 数据读取配置
+reading:
+  frequency: 100.0
+  available_bytes: 8
+  timeout: 0.1
+  retry_count: 3
+
+# RFID 工作模式配置
+mode:
+  mapping: true
+  initial_tag_id: 1
+  tag_distance_threshold: 1.0
+  min_signal_threshold: 0
+
+# 数据记录配置
+logging:
+  rfid_log_directory: "/home/sunqian/history/Rfid/"
+  tag_record_file: "/home/sunqian//A14.json"
+  enable_file_logging: true
+  max_file_size_mb: 10
+  max_backup_files: 5
